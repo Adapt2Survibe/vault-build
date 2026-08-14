@@ -1,0 +1,30 @@
+# vault-librarian config example.
+# Copy to config.personal.yaml (and later config.company.yaml) and edit per-vault.
+# Both real config files are gitignored to keep paths and any future secrets local.
+
+vault:
+  name: personal                                # personal | company
+  root: ./vault-personal              # absolute, ~, or checkout-relative
+
+embedding:
+  model: nomic-ai/nomic-embed-text-v1.5
+  dimensions: 768
+  device: cpu                                   # cpu | mps | cuda
+  # revision: <model-repo commit SHA>           # PIN THIS: trust_remote_code executes the repo's code
+
+store:
+  backend: sqlite-vec                           # sqlite-vec | qdrant
+  path: ./vault-personal/_maintenance/index.sqlite
+
+server:
+  host: 127.0.0.1
+  port: 8001                                    # convention: personal=8001, company=8002
+
+search:
+  default_top_k_wiki: 5
+  default_top_k_sources: 3
+  max_excerpt_words: 15                         # vault contract: never quote sources longer than this
+
+ingest:
+  chunk_size_tokens: 512                        # split sources into chunks before embedding
+  chunk_overlap_tokens: 64

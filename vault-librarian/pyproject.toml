@@ -1,0 +1,56 @@
+[project]
+name = "vault-librarian"
+version = "0.0.1"
+description = "MCP server providing semantic search over the vault's wiki and sources"
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+    # MCP server framework (Anthropic Python SDK for Model Context Protocol)
+    "mcp>=1.0.0",
+    # Embedding model loader
+    "sentence-transformers>=3.0.0",
+    # Required by nomic-embed-text-v1.5's trust_remote_code model implementation
+    "einops>=0.7",
+    # Vector store for Phase 1 (sqlite extension; minimal ops)
+    "sqlite-vec>=0.1.0",
+    # Vector math (store serializes float32 arrays)
+    "numpy>=1.26",
+    # Config + validation
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5.0",
+]
+
+[project.scripts]
+vault-librarian = "vault_librarian.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vault_librarian"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# iCloud sync-conflict artifacts ("name 2.py") — ~/Documents is iCloud-synced
+extend-exclude = ["* 2.py", "* 2"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-m 'not slow' --ignore-glob='* 2.py'"
+markers = [
+    "slow: requires the real embedding model (network download); excluded by default",
+]

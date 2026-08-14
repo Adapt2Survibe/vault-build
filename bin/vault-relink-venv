@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""vault-relink-venv — rewrite the librarian venv's src pointers.
+
+The 2026-08-10 ~/Documents/Dev → ~/Dev move left sitecustomize.py and the
+editable .pth pointing at a deleted path. MCP then died with
+ModuleNotFoundError: No module named 'vault_librarian'. This script is the
+mechanical repair so the next move (or venv rebuild) is one command, not a
+two-day outage.
+
+Stdlib-only ON PURPOSE (same reason as lesson-lint: must survive venv
+breakage). It NEVER loads the embedding model.
+
+Usage:
+    vault-relink-venv [--dry-run] [--venv PATH] [--src PATH]
+
+Defaults:
+    --venv  ~/.venvs/vault-librarian
+    --src   <this-repo>/vault-librarian/src
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+DEFAULT_VENV = Path.home() / ".venvs" / "vault-librarian"
+DEFAULT_SRC = REPO / "vault-librarian" / "src"
+
+SITECUSTOMIZE = """\
+# Durable guard against hidden-.pth landmines (uv UF_HIDDEN flags + Python
+# 3.12 site.py skipping hidden .pth files). sitecustomize is imported as a
+# regular module, so the hidden-file skip cannot disable it.
+# See vault-librarian/README.md (Install).
+# Rewritten by bin/vault-relink-venv — do not hand-edit the _SRC path.
+import sys
+
+_SRC = "{src}"
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+"""
+
+
+def fail(message: str) -> int:
+    print(f"vault-relink-venv: error: {message}", file=sys.stderr)
+    return 1
+
+
+def site_packages(venv: Path) -> Path | None:
+    lib = venv / "lib"
+    if not lib.is_dir():
+        return None
+    for child in sorted(lib.iterdir()):
+        if child.name.startswith("python"):
+            sp = child / "site-packages"
+            if sp.is_dir():
+                return sp
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="vault-relink-venv")
+    parser.add_argument("--venv", default=str(DEFAULT_VENV))
+    parser.add_argument("--src", default=str(DEFAULT_SRC))
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+
+    venv = Path(args.venv).expanduser()
+    src = Path(args.src).expanduser().resolve()
+    if not venv.is_dir():
+        return fail(f"venv not found: {venv}")
+    if not src.is_dir():
+        return fail(f"src not found: {src}")
+
+    sp = site_packages(venv)
+    if sp is None:
+        return fail(f"no site-packages under {venv}")
+
+    sc_path = sp / "sitecustomize.py"
+    pth_path = sp / "_editable_impl_vault_librarian.pth"
+    src_s = str(src)
+
+    already = True
+    if sc_path.is_file():
+        m = re.search(r'_SRC\s*=\s*["\']([^"\']+)["\']', sc_path.read_text(encoding="utf-8"))
+        already = already and m is not None and m.group(1) == src_s
+    else:
+        already = False
+    if pth_path.is_file():
+        already = already and pth_path.read_text(encoding="utf-8").strip() == src_s
+    else:
+        already = False
+
+    if already:
+        print(f"ok: already pointed at {src_s}")
+        return 0
+
+    if args.dry_run:
+        print(f"dry-run: would rewrite sitecustomize.py and {pth_path.name} → {src_s}")
+        return 0
+
+    sc_path.write_text(SITECUSTOMIZE.format(src=src_s), encoding="utf-8")
+    pth_path.write_text(src_s + "\n", encoding="utf-8")
+    print(f"rewrote: {sc_path}")
+    print(f"rewrote: {pth_path}")
+    print(f"ok: src → {src_s}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

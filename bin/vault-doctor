@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""vault-doctor — read-only vault health in one command.
+
+Catches the class of outage that killed MCP after the 2026-08-10 path move
+(sitecustomize/.pth pointed at a deleted tree) plus inbox, claims, index,
+phone stamp, volatile-lesson staleness, and leftover Documents/Dev refs.
+
+Stdlib-only ON PURPOSE. Never loads the embedding model.
+Quiet when healthy (--session-start is one line). Prominent on failure.
+
+Usage:
+    vault-doctor [--json] [--session-start] [--vault personal|company]
+                 [--root DIR] [--venv PATH] [--stale-days 90]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+DEFAULT_ROOT = Path(os.environ.get("VAULT_ROOT", str(REPO)))
+DEFAULT_VENV = Path.home() / ".venvs" / "vault-librarian"
+STALE_NEEDLE = "Documents/Dev/vault"
+DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+SRC_ASSIGN_RE = re.compile(r'_SRC\s*=\s*["\']([^"\']+)["\']')
+# Same line-anchored label matcher as bin/lesson-lint.find_value — corpus
+# notes write `As of:` and `**As of:**` interchangeably.
+STAMP_LABEL_RE = r"(?im)^\s*(?:[-*]\s+)?\**\s*{label}\s*\**\s*:\s*(.*?)\s*$"
+DAY = 86400
+
+
+def stamp_value(body: str, label: str) -> str | None:
+    m = re.search(STAMP_LABEL_RE.format(label=re.escape(label)), body)
+    if not m:
+        return None
+    return m.group(1).strip().strip("*").strip()
+
+
+def fail_usage(parser: argparse.ArgumentParser) -> int:
+    parser.print_usage(sys.stderr)
+    return 2
+
+
+def site_packages(venv: Path) -> Path | None:
+    lib = venv / "lib"
+    if not lib.is_dir():
+        return None
+    for child in sorted(lib.iterdir()):
+        if child.name.startswith("python"):
+            sp = child / "site-packages"
+            if sp.is_dir():
+                return sp
+    return None
+
+
+def parse_front_matter(text: str) -> tuple[dict[str, str], str]:
+    if not text.startswith("---"):
+        return {}, text
+    lines = text.split("\n")
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return {}, text
+    fm: dict[str, str] = {}
+    for line in lines[1:end]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            fm[k.strip()] = v.strip()
+    return fm, "\n".join(lines[end + 1 :])
+
+
+def tags_of(fm: dict[str, str]) -> list[str]:
+    raw = fm.get("tags", "")
+    raw = raw.strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    return [t.strip().strip("'\"") for t in raw.split(",") if t.strip()]
+
+
+def list_md(dir_path: Path, recursive: bool) -> list[Path]:
+    if not dir_path.is_dir():
+        return []
+    it = dir_path.rglob("*.md") if recursive else dir_path.glob("*.md")
+    return [p for p in it if p.name != "_index.md" and p.is_file()]
+
+
+def check_venv_src(venv: Path) -> dict:
+    if not venv.is_dir():
+        return {
+            "id": "venv_src_paths",
+            "ok": False,
+            "severity": "high",
+            "detail": f"venv not found: {venv}",
+        }
+    sp = site_packages(venv)
+    if sp is None:
+        return {
+            "id": "venv_src_paths",
+            "ok": False,
+            "severity": "high",
+            "detail": f"no site-packages under {venv}",
+        }
+    paths: list[str] = []
+    sc = sp / "sitecustomize.py"
+    if sc.is_file():
+        m = SRC_ASSIGN_RE.search(sc.read_text(encoding="utf-8"))
+        if m:
+            paths.append(m.group(1))
+    pth = sp / "_editable_impl_vault_librarian.pth"
+    if pth.is_file():
+        line = pth.read_text(encoding="utf-8").strip().splitlines()
+        if line:
+            paths.append(line[0].strip())
+    if not paths:
+        return {
+            "id": "venv_src_paths",
+            "ok": False,
+            "severity": "high",
+            "detail": "no sitecustomize/_SRC or editable .pth in venv",
+        }
+    missing = [p for p in paths if not Path(p).is_dir()]
+    if missing:
+        return {
+            "id": "venv_src_paths",
+            "ok": False,
+            "severity": "high",
+            "detail": "src path missing: " + "; ".join(missing),
+        }
+    return {
+        "id": "venv_src_paths",
+        "ok": True,
+        "severity": "high",
+        "detail": "src ok: " + ", ".join(dict.fromkeys(paths)),
+    }
+
+
+def check_vault_tree(vault: Path) -> dict:
+    missing = [name for name in ("wiki", "sources") if not (vault / name).is_dir()]
+    if not vault.is_dir():
+        return {
+            "id": "vault_tree",
+            "ok": False,
+            "severity": "high",
+            "detail": f"vault dir missing: {vault}",
+        }
+    if missing:
+        return {
+            "id": "vault_tree",
+            "ok": False,
+            "severity": "high",
+            "detail": f"missing {', '.join(missing)} under {vault.name}",
+        }
+    return {
+        "id": "vault_tree",
+        "ok": True,
+        "severity": "high",
+        "detail": f"{vault.name} has wiki + sources",
+    }
+
+
+def check_stale_refs(root: Path, venv: Path) -> dict:
+    hits: list[str] = []
+    unread = 0
+    scan_roots = [root / "slash-commands"]
+    for folder in scan_roots:
+        if not folder.is_dir():
+            continue
+        for path in folder.rglob("*.md"):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                unread += 1
+                continue
+            if STALE_NEEDLE in text:
+                hits.append(str(path.relative_to(root)))
+    sp = site_packages(venv) if venv.is_dir() else None
+    if sp:
+        sc = sp / "sitecustomize.py"
+        if sc.is_file() and STALE_NEEDLE in sc.read_text(encoding="utf-8"):
+            hits.append(str(sc))
+        pth = sp / "_editable_impl_vault_librarian.pth"
+        if pth.is_file() and STALE_NEEDLE in pth.read_text(encoding="utf-8"):
+            hits.append(str(pth))
+    if unread:
+        return {
+            "id": "stale_path_refs",
+            "ok": False,
+            "severity": "medium",
+            "detail": f"{unread} command file(s) unreadable; scan incomplete",
+        }
+    if hits:
+        return {
+            "id": "stale_path_refs",
+            "ok": False,
+            "severity": "medium",
+            "detail": "Documents/Dev/vault still in: " + ", ".join(hits[:8]),
+        }
+    return {
+        "id": "stale_path_refs",
+        "ok": True,
+        "severity": "medium",
+        "detail": "no leftover Documents/Dev/vault refs in commands/venv",
+    }
+
+
+def check_inbox(inbox: Path) -> dict:
+    if not inbox.is_dir():
+        return {
+            "id": "inbox_pending",
+            "ok": True,
+            "severity": "high",
+            "detail": "inbox dir missing (nothing pending)",
+        }
+    pending = [
+        p
+        for p in inbox.iterdir()
+        if p.is_file() and not p.name.startswith(".") and p.name != "README.md"
+    ]
+    now = time.time()
+    old = [p for p in pending if now - p.stat().st_mtime > DAY]
+    if old:
+        names = ", ".join(p.name for p in old[:5])
+        return {
+            "id": "inbox_pending",
+            "ok": False,
+            "severity": "high",
+            "detail": f"{len(old)} file(s) older than 24h: {names}",
+        }
+    return {
+        "id": "inbox_pending",
+        "ok": True,
+        "severity": "high",
+        "detail": f"{len(pending)} pending, all <24h" if pending else "inbox empty",
+    }
+
+
+def check_claimed(inbox: Path) -> dict:
+    if not inbox.is_dir():
+        return {
+            "id": "claimed_inbox",
+            "ok": True,
+            "severity": "high",
+            "detail": "inbox dir missing",
+        }
+    leftovers = [p.name for p in inbox.iterdir() if p.is_file() and p.name.startswith(".claimed-")]
+    if leftovers:
+        return {
+            "id": "claimed_inbox",
+            "ok": False,
+            "severity": "high",
+            "detail": f"{len(leftovers)} leftover claim(s): " + ", ".join(leftovers[:5]),
+        }
+    return {
+        "id": "claimed_inbox",
+        "ok": True,
+        "severity": "high",
+        "detail": "no leftover .claimed-* files",
+    }
+
+
+def check_volatile(sources: Path, stale_days: int) -> dict:
+    if not sources.is_dir():
+        return {
+            "id": "volatile_lessons",
+            "ok": True,
+            "severity": "medium",
+            "detail": "no sources dir",
+        }
+    stale: list[str] = []
+    total = 0
+    cutoff = time.time() - stale_days * DAY
+    for path in list_md(sources, recursive=False):
+        text = path.read_text(encoding="utf-8")
+        fm, body = parse_front_matter(text)
+        tags = [t.lower() for t in tags_of(fm)]
+        vol = (stamp_value(body, "Volatility") or "").lower()
+        is_vol = "volatile" in tags or vol.startswith("volatile")
+        if not is_vol:
+            continue
+        total += 1
+        as_of = stamp_value(body, "As of")
+        if not as_of:
+            stale.append(f"{path.stem} (no As of)")
+            continue
+        dm = DATE_RE.search(as_of)
+        if not dm:
+            stale.append(f"{path.stem} (unparseable As of)")
+            continue
+        y, m, d = (int(x) for x in dm.group(1).split("-"))
+        try:
+            ts = time.mktime((y, m, d, 0, 0, 0, 0, 0, -1))
+        except OverflowError:
+            stale.append(f"{path.stem} (bad date)")
+            continue
+        if ts < cutoff:
+            stale.append(path.stem)
+    if stale:
+        return {
+            "id": "volatile_lessons",
+            "ok": False,
+            "severity": "medium",
+            "detail": f"{len(stale)}/{total} older than {stale_days}d: "
+            + ", ".join(stale[:8]),
+        }
+    return {
+        "id": "volatile_lessons",
+        "ok": True,
+        "severity": "medium",
+        "detail": f"{total} volatile lesson(s), none older than {stale_days}d",
+    }
+
+
+def check_needs_synthesis(wiki: Path) -> dict:
+    if not wiki.is_dir():
+        return {
+            "id": "needs_synthesis",
+            "ok": True,
+            "severity": "low",
+            "detail": "no wiki dir",
+        }
+    stubs: list[str] = []
+    for path in list_md(wiki, recursive=True):
+        fm, _ = parse_front_matter(path.read_text(encoding="utf-8"))
+        if "needs-synthesis" in tags_of(fm):
+            stubs.append(path.stem)
+    return {
+        "id": "needs_synthesis",
+        "ok": True,
+        "severity": "low",
+        "detail": f"{len(stubs)} stub(s)",
+        "count": len(stubs),
+    }
+
+
+def check_phone(stamp: Path) -> dict:
+    if not stamp.is_file():
+        return {
+            "id": "phone_stamp",
+            "ok": True,
+            "severity": "low",
+            "detail": "no phone-channel-stamp.json (daemon unused)",
+        }
+    try:
+        data = json.loads(stamp.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return {
+            "id": "phone_stamp",
+            "ok": False,
+            "severity": "medium",
+            "detail": f"stamp unreadable: {exc}",
+        }
+    if data.get("ok") is False:
+        return {
+            "id": "phone_stamp",
+            "ok": False,
+            "severity": "medium",
+            "detail": f"stamp ok=false reason={data.get('reason')!r}",
+        }
+    return {
+        "id": "phone_stamp",
+        "ok": True,
+        "severity": "low",
+        "detail": f"last ran {data.get('ran_at')} pending={data.get('pending')}",
+    }
+
+
+def check_librarian_status(root: Path, venv: Path, vault_name: str) -> dict:
+    bin_path = venv / "bin" / "vault-librarian"
+    cfg_name = f"config.{vault_name}.yaml"
+    cfg = root / "vault-librarian" / cfg_name
+    if not venv.is_dir():
+        return {
+            "id": "librarian_status",
+            "ok": True,
+            "severity": "low",
+            "detail": "venv missing — see venv_src_paths",
+        }
+    if not bin_path.is_file():
+        return {
+            "id": "librarian_status",
+            "ok": False,
+            "severity": "high",
+            "detail": f"librarian bin missing: {bin_path}",
+        }
+    if not cfg.is_file():
+        return {
+            "id": "librarian_status",
+            "ok": False,
+            "severity": "medium",
+            "detail": f"{cfg_name} missing",
+        }
+    try:
+        proc = subprocess.run(
+            [str(bin_path), "status", "--config", str(cfg)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "id": "librarian_status",
+            "ok": False,
+            "severity": "high",
+            "detail": f"status failed: {exc}",
+        }
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout).strip().splitlines()
+        last = err[-1] if err else f"exit {proc.returncode}"
+        return {
+            "id": "librarian_status",
+            "ok": False,
+            "severity": "high",
+            "detail": last[:200],
+        }
+    line = proc.stdout.strip().splitlines()
+    payload = line[-1] if line else ""
+    try:
+        json.loads(payload)
+    except json.JSONDecodeError:
+        return {
+            "id": "librarian_status",
+            "ok": False,
+            "severity": "high",
+            "detail": "status printed no JSON line",
+        }
+    return {
+        "id": "librarian_status",
+        "ok": True,
+        "severity": "high",
+        "detail": payload[:200],
+    }
+
+
+def counts(vault: Path) -> dict[str, int]:
+    inbox = vault / "inbox"
+    pending = 0
+    if inbox.is_dir():
+        pending = sum(
+            1
+            for p in inbox.iterdir()
+            if p.is_file() and not p.name.startswith(".") and p.name != "README.md"
+        )
+    return {
+        "wiki": len(list_md(vault / "wiki", recursive=True)),
+        "sources": len(list_md(vault / "sources", recursive=False)),
+        "inbox": pending,
+    }
+
+
+def report(root: Path, vault_name: str, venv: Path, stale_days: int) -> dict:
+    vault = root / f"vault-{vault_name}"
+    checks = [
+        check_vault_tree(vault),
+        check_venv_src(venv),
+        check_stale_refs(root, venv),
+        check_inbox(vault / "inbox"),
+        check_claimed(vault / "inbox"),
+        check_volatile(vault / "sources", stale_days),
+        check_needs_synthesis(vault / "wiki"),
+        check_phone(vault / "_maintenance" / "phone-channel-stamp.json"),
+        check_librarian_status(root, venv, vault_name),
+    ]
+    highs_failed = [c for c in checks if not c["ok"] and c["severity"] == "high"]
+    return {
+        "ok": not highs_failed,
+        "counts": counts(vault),
+        "checks": checks,
+    }
+
+
+def print_session_start(data: dict) -> int:
+    c = data["counts"]
+    highs = [ch for ch in data["checks"] if not ch["ok"] and ch["severity"] == "high"]
+    if highs:
+        for ch in highs:
+            print(f"vault: FAIL {ch['id']} ({ch['detail']})")
+        return 1
+    print(f"vault: ok  ({c['wiki']} wiki, {c['sources']} sources, {c['inbox']} inbox)")
+    notes = [ch for ch in data["checks"] if not ch["ok"] and ch["severity"] != "high"]
+    for ch in notes[:3]:
+        print(f"vault: note {ch['id']} — {ch['detail']}")
+    return 0
+
+
+def print_human(data: dict) -> int:
+    c = data["counts"]
+    print(f"vault-doctor — wiki {c['wiki']}  sources {c['sources']}  inbox {c['inbox']}")
+    for ch in data["checks"]:
+        mark = "ok" if ch["ok"] else ch["severity"].upper()
+        print(f"  [{mark}] {ch['id']}: {ch['detail']}")
+    return 0 if data["ok"] else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="vault-doctor")
+    parser.add_argument("--root", default=str(DEFAULT_ROOT))
+    parser.add_argument("--venv", default=str(DEFAULT_VENV))
+    parser.add_argument("--vault", choices=("personal", "company"), default="personal")
+    parser.add_argument("--stale-days", type=int, default=90)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--session-start", action="store_true")
+    args = parser.parse_args(argv)
+
+    root = Path(args.root).expanduser()
+    venv = Path(args.venv).expanduser()
+    data = report(root, args.vault, venv, args.stale_days)
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+        return 0 if data["ok"] else 1
+    if args.session_start:
+        return print_session_start(data)
+    return print_human(data)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

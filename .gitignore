@@ -1,0 +1,52 @@
+# Vault data is never committed. Keep the empty skeleton (.gitkeep only).
+vault-personal/**
+!vault-personal/**/
+!vault-personal/**/.gitkeep
+vault-company/**
+!vault-company/**/
+!vault-company/**/.gitkeep
+
+# iCloud sync-conflict artifacts (~/Documents is iCloud-synced; conflicts mint "name 2.ext")
+* 2.*
+* 2
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Secrets / config with secrets
+.env
+.env.local
+*.key
+*.pem
+secrets/
+config.personal.yaml
+config.company.yaml
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build / dist
+dist/
+build/
+*.egg
+
+# Vector store binary files
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Isolated git worktrees (never commit a checkout)
+.worktrees/

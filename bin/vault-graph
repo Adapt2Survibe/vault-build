@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""vault-graph — deterministic wiki backlinks, orphans, broken links.
+
+The 2026-07-21 architecture gauntlet killed an auto-hub *pipeline*. This is
+the floor that still earns "I imagined my own wiki": what points here, which
+slugs collide, which links are dead. Stdlib-only. Read-only.
+
+Usage:
+    vault-graph [--root DIR] [--vault personal|company] [--json]
+    vault-graph [--root DIR] --page SLUG
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
+DEFAULT_ROOT = Path(os.environ.get("VAULT_ROOT", Path(__file__).resolve().parents[1]))
+
+
+def fail(message: str) -> int:
+    print(f"vault-graph: error: {message}", file=sys.stderr)
+    return 1
+
+
+def parse_front_matter(text: str) -> tuple[dict[str, str], str]:
+    if not text.startswith("---"):
+        return {}, text
+    lines = text.split("\n")
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return {}, text
+    fm: dict[str, str] = {}
+    for line in lines[1:end]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            fm[k.strip()] = v.strip().strip("'\"")
+    return fm, "\n".join(lines[end + 1 :])
+
+
+def strip_fences(body: str) -> str:
+    out: list[str] = []
+    in_fence = False
+    for line in body.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            out.append(line)
+    return "\n".join(out)
+
+
+def normalize_target(raw: str) -> str:
+    target = raw.split("|", 1)[0]
+    target = target.split("#", 1)[0]
+    target = target.strip()
+    if target.endswith(".md"):
+        target = target[: -len(".md")]
+    return target
+
+
+def discover_pages(wiki: Path) -> dict[str, Path]:
+    pages: dict[str, Path] = {}
+    for path in sorted(wiki.rglob("*.md")):
+        if path.name == "_index.md":
+            continue
+        rel = path.relative_to(wiki).with_suffix("").as_posix()
+        pages[f"wiki/{rel}"] = path
+    return pages
+
+
+def resolve(target: str, pages: dict[str, Path]) -> list[str]:
+    if target in pages:
+        return [target]
+    if target.startswith("wiki/") and target in pages:
+        return [target]
+    # bare slug or section/page without wiki/ prefix
+    hits = []
+    stem = target.rsplit("/", 1)[-1]
+    for doc_id in pages:
+        if doc_id == f"wiki/{target}" or doc_id.endswith(f"/{stem}") or doc_id == f"wiki/{stem}":
+            if target.count("/") == 0:
+                if doc_id.rsplit("/", 1)[-1] == stem:
+                    hits.append(doc_id)
+            elif doc_id == f"wiki/{target}":
+                hits.append(doc_id)
+    # unique preserve order
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for h in hits:
+        if h not in seen:
+            seen.add(h)
+            uniq.append(h)
+    return uniq
+
+
+def extract_links(body: str) -> list[str]:
+    return [normalize_target(m.group(1)) for m in LINK_RE.finditer(strip_fences(body))]
+
+
+def build_graph(wiki: Path) -> dict:
+    pages = discover_pages(wiki)
+    outlinks: dict[str, list[str]] = {doc_id: [] for doc_id in pages}
+    backlinks: dict[str, list[str]] = {doc_id: [] for doc_id in pages}
+    broken: list[dict[str, str]] = []
+    forms = {"bare": 0, "path": 0}
+
+    for doc_id, path in pages.items():
+        text = path.read_text(encoding="utf-8")
+        _fm, body = parse_front_matter(text)
+        for raw in extract_links(body):
+            if not raw:
+                continue
+            if raw.startswith("wiki/") or "/" in raw:
+                forms["path"] += 1
+            else:
+                forms["bare"] += 1
+            hits = resolve(raw, pages)
+            if not hits:
+                broken.append({"from": doc_id, "to": raw})
+                continue
+            # Ambiguous bare slug: still count as a link to every hit so
+            # collisions surface separately; don't mark broken.
+            for hit in hits:
+                if hit not in outlinks[doc_id]:
+                    outlinks[doc_id].append(hit)
+                if doc_id not in backlinks[hit]:
+                    backlinks[hit].append(doc_id)
+
+    stems: dict[str, list[str]] = {}
+    for doc_id in pages:
+        stems.setdefault(doc_id.rsplit("/", 1)[-1], []).append(doc_id)
+    collisions = [
+        {"stem": stem, "pages": ids} for stem, ids in sorted(stems.items()) if len(ids) > 1
+    ]
+
+    orphans = sorted(doc_id for doc_id, bl in backlinks.items() if not bl)
+    hubs = sorted(
+        ({"id": doc_id, "in_degree": len(bl)} for doc_id, bl in backlinks.items() if len(bl) >= 3),
+        key=lambda h: (-h["in_degree"], h["id"]),
+    )
+
+    page_rows = []
+    for doc_id in sorted(pages):
+        page_rows.append(
+            {
+                "id": doc_id,
+                "path": str(pages[doc_id]),
+                "outlinks": outlinks[doc_id],
+                "backlinks": backlinks[doc_id],
+            }
+        )
+
+    return {
+        "pages": page_rows,
+        "broken": broken,
+        "orphans": orphans,
+        "collisions": collisions,
+        "hubs": hubs,
+        "link_forms": forms,
+        "counts": {
+            "pages": len(page_rows),
+            "broken": len(broken),
+            "orphans": len(orphans),
+            "collisions": len(collisions),
+            "links_bare": forms["bare"],
+            "links_path": forms["path"],
+        },
+    }
+
+
+def print_page(graph: dict, query: str) -> int:
+    q = query.strip()
+    if q.endswith(".md"):
+        q = q[: -len(".md")]
+    matches = [
+        p
+        for p in graph["pages"]
+        if p["id"] == q
+        or p["id"] == f"wiki/{q}"
+        or p["id"].endswith(f"/{q}")
+        or p["id"].rsplit("/", 1)[-1] == q
+    ]
+    if not matches:
+        return fail(f"no page matching {query!r}")
+    for p in matches:
+        print(p["id"])
+        print(f"  backlinks ({len(p['backlinks'])}):")
+        if p["backlinks"]:
+            for b in p["backlinks"]:
+                print(f"    ← {b}")
+        else:
+            print("    (none)")
+        print(f"  outlinks ({len(p['outlinks'])}):")
+        if p["outlinks"]:
+            for o in p["outlinks"]:
+                print(f"    → {o}")
+        else:
+            print("    (none)")
+    return 0
+
+
+def print_human(graph: dict) -> int:
+    c = graph["counts"]
+    print(
+        f"wiki graph — {c['pages']} pages, {c['broken']} broken, "
+        f"{c['orphans']} orphans, {c['collisions']} slug collisions, "
+        f"links {c['links_bare']} bare / {c['links_path']} path"
+    )
+    if graph["hubs"]:
+        print("hubs (in-degree ≥ 3):")
+        for h in graph["hubs"][:15]:
+            print(f"  {h['id']}  ←{h['in_degree']}")
+    if graph["collisions"]:
+        print("slug collisions:")
+        for col in graph["collisions"]:
+            print(f"  {col['stem']}: {', '.join(col['pages'])}")
+    if graph["broken"]:
+        print("broken links (first 20):")
+        for b in graph["broken"][:20]:
+            print(f"  {b['from']} → [[{b['to']}]]")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="vault-graph")
+    parser.add_argument("--root", default=str(DEFAULT_ROOT))
+    parser.add_argument("--vault", choices=("personal", "company"), default="personal")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--list", action="store_true", help="print page ids, one per line")
+    parser.add_argument("--page")
+    args = parser.parse_args(argv)
+
+    root = Path(args.root).expanduser()
+    wiki = root / f"vault-{args.vault}" / "wiki"
+    if not wiki.is_dir():
+        return fail(f"wiki not found: {wiki}")
+
+    graph = build_graph(wiki)
+    if args.page:
+        return print_page(graph, args.page)
+    if args.list:
+        for p in graph["pages"]:
+            print(p["id"])
+        return 0
+    if args.json:
+        print(json.dumps(graph, indent=2, sort_keys=True))
+        return 0
+    return print_human(graph)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

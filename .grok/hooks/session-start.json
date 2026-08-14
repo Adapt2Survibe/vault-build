@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "../../bin/vault-doctor --session-start",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

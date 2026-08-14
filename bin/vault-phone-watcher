@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""vault-phone-watcher — drain the iCloud VaultDrop folder into the vault inbox.
+
+Zero-dependency (stdlib only). Runs under launchd (WatchPaths + 5-min sweep);
+spec: docs/superpowers/specs/2026-06-12-phone-capture-channel-design.md
+(including the review-wall amendments).
+
+Per file in $VAULTDROP_DIR: classify (lone URL vs text), delegate the write to
+bin/vault-capture --via phone (the canonical front-matter writer), delete on
+success, keep on failure (the folder IS the retry queue and the staleness
+signal). Empty/undecodable/symlink entries quarantine to .failed/. Every run
+writes an atomic stamp JSON — CB-12: deterministic code stamps, never the
+model — and the top-level handler stamps even on unexpected crashes.
+
+Env overrides (tests): VAULTDROP_DIR, VAULT_ROOT, VAULT_CAPTURE_BIN,
+VAULT_LOCK_FILE, VAULT_CAPTURE_TIMEOUT.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import traceback
+from datetime import datetime, timedelta
+from pathlib import Path
+
+DEFAULT_DROP = "~/Library/Mobile Documents/com~apple~CloudDocs/VaultDrop"
+DEFAULT_ROOT = str(Path(__file__).resolve().parents[1])
+# The lock lives OUTSIDE iCloud-synced space: fileproviderd can swap inodes in
+# synced folders, and flock binds to the inode.
+DEFAULT_LOCK = "/tmp/vault-phone-watcher.lock"
+URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
+CADENCE_SECONDS = 300  # launchd StartInterval; stamp self-declares it
+STALE_AFTER_SECONDS = 600  # staleness budget consumers read via next_run_by
+BRCTL_TIMEOUT = 30
+
+
+def write_stamp(stamp_path: Path, **fields: object) -> None:
+    """Atomic stamp write (temp + rename) so readers never see a torn file."""
+    now = datetime.now().astimezone()
+    payload = {
+        "ran_at": now.isoformat(timespec="seconds"),
+        "ok": fields["ok"],
+        "reason": fields.get("reason"),
+        "processed": fields.get("processed", 0),
+        "failed": fields.get("failed", 0),
+        "pending": fields.get("pending", 0),
+        "quarantined": fields.get("quarantined", 0),
+        "cadence_seconds": CADENCE_SECONDS,
+        "next_run_by": (now + timedelta(seconds=STALE_AFTER_SECONDS)).isoformat(
+            timespec="seconds"
+        ),
+    }
+    stamp_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = stamp_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(stamp_path)
+
+
+def quarantine(path: Path, failed_dir: Path) -> None:
+    """Move a bad drop entry aside as evidence (never delete on failure)."""
+    failed_dir.mkdir(exist_ok=True)
+    dest = failed_dir / path.name
+    counter = 2
+    while dest.exists() or dest.is_symlink():
+        dest = failed_dir / f"{path.stem}-{counter}{path.suffix}"
+        counter += 1
+    path.rename(dest)
+
+
+def _is_pending(p: Path) -> bool:
+    """A drop entry awaiting capture: any non-hidden file, plus .icloud
+    placeholders (dot-prefixed, but they ARE captures stuck mid-sync — they
+    must show in `pending` so the stuck-captures alarm can see them)."""
+    if not p.is_file():
+        return False
+    return not p.name.startswith(".") or p.name.endswith(".icloud")
+
+
+def drain(drop: Path, root: Path, capture_bin: Path, stamp_path: Path) -> int:
+    capture_timeout = float(os.environ.get("VAULT_CAPTURE_TIMEOUT", "60"))
+    processed = failed = quarantined = 0
+    failed_dir = drop / ".failed"
+    reasons: list[str] = []
+
+    try:
+        entries = sorted(p for p in drop.iterdir() if p.is_file() or p.is_symlink())
+    except OSError as exc:
+        print(f"vault-phone-watcher: cannot enumerate {drop}: {exc}", file=sys.stderr)
+        write_stamp(stamp_path, ok=False, reason=f"cannot enumerate drop folder: {exc}")
+        return 1
+
+    for path in entries:
+        name = path.name
+        try:
+            if path.is_symlink():
+                # Security: following a symlink would read an arbitrary local
+                # file into the vault. Quarantine the LINK, never the target.
+                print(f"vault-phone-watcher: quarantining symlink {name}", file=sys.stderr)
+                quarantine(path, failed_dir)
+                quarantined += 1
+                continue
+            # .icloud placeholders are dot-prefixed; this check runs BEFORE the
+            # dotfile skip on purpose so materialization gets requested.
+            if name.endswith(".icloud"):
+                try:
+                    res = subprocess.run(
+                        ["brctl", "download", str(path)],
+                        capture_output=True,
+                        text=True,
+                        timeout=BRCTL_TIMEOUT,
+                    )
+                    if res.returncode != 0:
+                        tail = res.stderr.strip().splitlines()
+                        print(
+                            f"vault-phone-watcher: brctl download failed for {name}:"
+                            f" {tail[-1] if tail else f'rc {res.returncode}'}",
+                            file=sys.stderr,
+                        )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    print(
+                        f"vault-phone-watcher: brctl unavailable for {name}:"
+                        f" {type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                continue  # placeholder stays; counted in pending below
+            if name.startswith("."):
+                continue
+
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                continue  # vanished mid-run (iCloud race) — nothing to do
+            except (OSError, UnicodeDecodeError) as exc:
+                print(
+                    f"vault-phone-watcher: quarantining {name}: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                quarantine(path, failed_dir)
+                quarantined += 1
+                continue
+            if not text:
+                print(f"vault-phone-watcher: quarantining empty {name}", file=sys.stderr)
+                quarantine(path, failed_dir)
+                quarantined += 1
+                continue
+
+            if "\n" not in text and URL_RE.match(text):
+                cmd = [sys.executable, str(capture_bin), text, "--via", "phone"]
+                stdin_payload = None
+            else:
+                cmd = [sys.executable, str(capture_bin), "-", "--via", "phone"]
+                stdin_payload = text
+            try:
+                result = subprocess.run(
+                    cmd,
+                    input=stdin_payload,
+                    capture_output=True,
+                    text=True,
+                    timeout=capture_timeout,
+                    env={**os.environ, "VAULT_ROOT": str(root)},
+                )
+            except subprocess.TimeoutExpired:
+                reasons.append(f"{name}: capture timeout after {capture_timeout:.0f}s")
+                print(f"vault-phone-watcher: {reasons[-1]}", file=sys.stderr)
+                failed += 1
+                continue
+            if result.returncode == 0:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    # Capture succeeded; the inbox copy is canonical. Leaving
+                    # the drop file risks a -2 duplicate next run — say so.
+                    print(
+                        f"vault-phone-watcher: captured {name} but could not remove"
+                        f" the drop file ({exc}) — may re-capture next run",
+                        file=sys.stderr,
+                    )
+                processed += 1
+            else:
+                # Keep the file: the folder is the retry queue, and the >10-min
+                # staleness alarm turns a poison file into a visible flag.
+                err = result.stderr.strip().splitlines()
+                reasons.append(
+                    f"{name}: rc {result.returncode}: {err[-1] if err else 'no stderr'}"
+                )
+                print(f"vault-phone-watcher: capture failed for {reasons[-1]}", file=sys.stderr)
+                failed += 1
+        except OSError as exc:
+            # Per-file fault isolation: one weird entry (eviction race, rename
+            # failure) must not abort the drain or skip the stamp.
+            reasons.append(f"{name}: {type(exc).__name__}: {exc}")
+            print(f"vault-phone-watcher: error on {reasons[-1]}", file=sys.stderr)
+            failed += 1
+
+    try:
+        pending = sum(1 for p in drop.iterdir() if _is_pending(p))
+    except OSError:
+        pending = -1  # enumeration broke mid-run; stamp still lands
+
+    write_stamp(
+        stamp_path,
+        ok=failed == 0,
+        reason="; ".join(reasons) if reasons else None,
+        processed=processed,
+        failed=failed,
+        pending=pending,
+        quarantined=quarantined,
+    )
+    return 0
+
+
+def main() -> int:
+    drop = Path(os.environ.get("VAULTDROP_DIR", DEFAULT_DROP)).expanduser()
+    root = Path(os.environ.get("VAULT_ROOT", DEFAULT_ROOT)).expanduser()
+    capture_bin = Path(
+        os.environ.get("VAULT_CAPTURE_BIN", str(root / "bin" / "vault-capture"))
+    ).expanduser()
+    lock_file = Path(os.environ.get("VAULT_LOCK_FILE", DEFAULT_LOCK)).expanduser()
+    # Stamp path is personal-vault-only by design (spec §Scope-cuts: company
+    # routing is a later decision).
+    stamp_path = root / "vault-personal" / "_maintenance" / "phone-channel-stamp.json"
+
+    if not drop.is_dir():
+        print(f"vault-phone-watcher: drop folder missing: {drop}", file=sys.stderr)
+        write_stamp(stamp_path, ok=False, reason=f"drop folder missing: {drop}")
+        return 1
+
+    # WatchPaths and the interval sweep can fire together; one drainer at a time.
+    lock_handle = open(lock_file, "w")
+    try:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return 0  # a sibling owns this cycle; it will stamp
+
+    try:
+        return drain(drop, root, capture_bin, stamp_path)
+    except Exception as exc:  # last-resort: the stamp must carry the crash
+        traceback.print_exc()
+        try:
+            write_stamp(stamp_path, ok=False, reason=f"watcher crashed: {exc!r}")
+        except OSError:
+            pass  # stderr (launchd err.log) is the only remaining trace
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

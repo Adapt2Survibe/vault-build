@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""lesson-lint — the deterministic FORM gate for vault lesson notes.
+
+Spec: docs/lesson-schema.md § Enforcement (corpus-validated).
+Stdlib-only ON PURPOSE (the vault's own lessons document the venv/.pth breaking, so
+this must not import vault-librarian). It NEVER edits a note — it reports only.
+
+Lints only notes whose front-matter `via` is exactly `lesson-capture`; every other
+note is a no-op PASS. HARD checks failing → nonzero exit. FLAG checks are advisory
+(printed, never block). Judgment checks (is-it-cross-project, is-the-durable/volatile
+call right, is-the-title-really-symptom-first) are NOT here — those are the AI's.
+
+Usage: lesson-lint <file-or-dir> [<file-or-dir> ...]
+"""
+from __future__ import annotations
+
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+VOL_RE = re.compile(r"(?i)^\s*(durable|volatile)\b")
+# The sanctioned "no recheck" forms, ANCHORED TO END OF VALUE. The corpus writes
+# exactly three: "n/a", "n/a.", "n/a (durable — timeless)." Anchoring matters —
+# an unanchored prefix match swallowed substantive recipes ("NA region failover
+# drill", "n/a unless the API changes — then re-run the smoke test"), silently
+# dropping them from duplicate grouping, which is the very silent-pass this gate
+# is meant to close. Found by the 2026-08-07 review wall.
+NA_RE = re.compile(r"(?i)^\s*n\s*/\s*a\s*\.?\s*(\([^)]*\))?\s*\.?\s*$")
+SOLUTION_WORDS = {"fix", "patch", "workaround", "solution"}
+
+
+def parse_front_matter(text: str) -> tuple[dict, str]:
+    if not text.startswith("---"):
+        return {}, text
+    lines = text.split("\n")
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return {}, text
+    fm: dict = {}
+    for line in lines[1:end]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            fm[k.strip()] = unquote(v)
+    return fm, "\n".join(lines[end + 1 :])
+
+
+def unquote(value: str) -> str:
+    """Strip one layer of surrounding double/single quotes.
+
+    vault-capture writes YAML-safe JSON-quoted scalars (via: "lesson-capture",
+    tags: ["a", "durable"]); Scribe rewrites sources unquoted. The gate must
+    parse BOTH — a quoted `via` silently no-oping the linter was the P0 the
+    Phase-2 gauntlet caught (a vacuous gate is not a gate).
+    """
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def parse_tags(raw: str) -> list[str]:
+    raw = raw.strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    return [unquote(t) for t in raw.split(",") if unquote(t)]
+
+
+def find_value(body: str, label: str) -> str | None:
+    """The value after a LINE-anchored label (plain or **bold**), or None if absent.
+
+    Used for the stamp lines (Volatility/As of/Verify), which are always their own
+    line in a conforming note and whose *value* we need to inspect.
+    """
+    pat = rf"(?im)^\s*(?:[-*]\s+)?\**\s*{re.escape(label)}\s*\**\s*:\s*(.*?)\s*$"
+    m = re.search(pat, body)
+    if not m:
+        return None
+    return m.group(1).strip().strip("*").strip()
+
+
+def normalize_verify(value: str | None) -> str | None:
+    """Comparison key for a `Verify:` value, or None if it must not participate.
+
+    Excluded: absent/empty values and every 'n/a' variant. 73 of the corpus's 126
+    lesson notes carry a sanctioned n/a form ('n/a', 'n/a.', 'n/a (durable —
+    timeless).') — grouping those would fire on most batches, and a noisy advisory
+    gets mentally filtered, which is the failure this check exists to prevent.
+    """
+    if value is None:
+        return None
+    v = value.strip()
+    if not v or NA_RE.match(v):
+        return None
+    return " ".join(v.split()).casefold().rstrip(". ") or None
+
+
+def has_label(body: str, label: str) -> bool:
+    """Whether a body carries `Label:` — line-start OR inline in prose.
+
+    Used for presence-only body labels (Scope/Fix/Symptom/Tell): lessons write these
+    either on their own line or inline ("...Fix: do X. Scope: macOS."), so this is a
+    word-boundary substring check per the schema spec, not line-anchored.
+    """
+    return re.search(rf"(?i)(?<![A-Za-z]){re.escape(label)}\s*:", body) is not None
+
+
+def lint_note(path: Path) -> tuple[list[str], list[str], bool, str | None]:
+    """Return (hard_fails, flags, was_linted, verify_val).
+
+    was_linted=False means no-op (not a lesson). verify_val is the raw `Verify:`
+    value (or None) and is returned ONLY so main() can run the batch-scoped
+    duplicate check across notes — a per-note function cannot see its siblings.
+    """
+    text = path.read_text(encoding="utf-8")
+    fm, body = parse_front_matter(text)
+    if fm.get("via") != "lesson-capture":
+        return [], [], False, None
+
+    fails: list[str] = []
+    flags: list[str] = []
+
+    tags = parse_tags(fm.get("tags", ""))
+    vol_tags = [t for t in tags if t.lower() in ("durable", "volatile")]
+
+    # HARD 2 — exactly one volatility tag
+    if len(vol_tags) != 1:
+        fails.append(f"tags must carry exactly one of durable|volatile (found {vol_tags})")
+
+    vol_val = find_value(body, "Volatility")
+    asof_val = find_value(body, "As of")
+    verify_val = find_value(body, "Verify")
+
+    # HARD 4 — stamp lines present
+    if vol_val is None:
+        fails.append("missing 'Volatility:' stamp line")
+    if asof_val is None:
+        fails.append("missing 'As of:' stamp line")
+    if verify_val is None:
+        fails.append("missing 'Verify:' stamp line")
+    elif not verify_val.strip():
+        # A present-but-empty value ("- **Verify:**") passed everything: HARD-4
+        # tests `is None` and gets '', FLAG d's n/a check doesn't match '', and the
+        # batch pass excludes it. Substantively it IS the missing stamp.
+        fails.append("'Verify:' stamp line is present but empty")
+
+    # HARD 5 — Volatility value begins durable|volatile
+    vol_kw = None
+    if vol_val is not None:
+        m = VOL_RE.match(vol_val)
+        if not m:
+            fails.append(f"'Volatility:' must begin with durable|volatile (got {vol_val!r})")
+        else:
+            vol_kw = m.group(1).lower()
+
+    # HARD 3 — tag ↔ Volatility value consistency
+    if len(vol_tags) == 1 and vol_kw is not None and vol_tags[0].lower() != vol_kw:
+        fails.append(
+            f"tag {vol_tags[0]!r} does not match Volatility value {vol_kw!r} — must be consistent"
+        )
+
+    # HARD 6 — As of contains a parseable date
+    if asof_val is not None:
+        dm = DATE_RE.search(asof_val)
+        if not dm:
+            fails.append(f"'As of:' has no YYYY-MM-DD date (got {asof_val!r})")
+        else:
+            try:
+                datetime.strptime(dm.group(0), "%Y-%m-%d")
+            except ValueError:
+                fails.append(f"'As of:' date does not parse ({dm.group(0)!r})")
+
+    # HARD 7 — Scope present (line-start or inline in prose)
+    if not has_label(body, "Scope"):
+        fails.append("body missing the required 'Scope:' label")
+
+    # FLAG a — title may not be symptom-first
+    title = fm.get("title", "")
+    words = title.split()
+    last = words[-1].lower().rstrip(".:") if words else ""
+    if last in SOLUTION_WORDS or len(words) < 4:
+        flags.append(f"title may not be symptom-first (solution/topic-first?): {title!r}")
+
+    # FLAG b — missing Fix / diagnostic labels (line-start or inline)
+    if not has_label(body, "Fix"):
+        flags.append("body missing a 'Fix:' label")
+    if not has_label(body, "Symptom") and not has_label(body, "Tell"):
+        flags.append("body missing a diagnostic 'Symptom:'/'Tell:' label")
+
+    # FLAG c/d — volatile-specific
+    effective = vol_kw or (vol_tags[0].lower() if len(vol_tags) == 1 else None)
+    if effective == "volatile":
+        if asof_val is not None and not re.search(r"[A-Za-z0-9]", DATE_RE.sub("", asof_val)):
+            flags.append("volatile lesson's 'As of:' carries only a bare date (no version token)")
+        # Reuse NA_RE so this advisory and the batch-grouping exclusion agree on
+        # every input BY CONSTRUCTION. They previously used two different notions
+        # of "n/a" and agreed only by corpus coincidence.
+        if verify_val is not None and NA_RE.match(verify_val):
+            flags.append("volatile lesson has 'Verify: n/a' — should carry a real recheck")
+
+    return fails, flags, True, verify_val
+
+
+_ARCHIVE_DIRS = {"_processed", ".failed"}  # archived / quarantined — history, not live notes
+
+
+def iter_notes(paths: list[str]):
+    for raw in paths:
+        p = Path(raw)
+        if p.is_dir():
+            for note in sorted(p.rglob("*.md")):
+                # skip archive/quarantine dirs in dir-mode; explicit file paths
+                # still lint anything (you can always point at an archived file)
+                if _ARCHIVE_DIRS & set(part for part in note.relative_to(p).parts[:-1]):
+                    continue
+                yield note
+        elif p.is_file():
+            yield p
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+    if not argv:
+        print("usage: lesson-lint <file-or-dir> ...", file=sys.stderr)
+        return 2
+    any_fail = False
+    linted = 0
+    seen = 0
+    failed_notes = 0
+    results: list[list] = []  # [note, fails, flags, verify_val]
+    for note in iter_notes(argv):
+        seen += 1
+        try:
+            fails, flags, was, verify_val = lint_note(note)
+        # UnicodeDecodeError subclasses ValueError, NOT OSError, so a single
+        # non-UTF-8 byte previously escaped this handler and aborted the whole run
+        # — and collect-then-print discarded the already-linted siblings' results
+        # with it. An undecodable note is a malformed note; quarantine it per-file.
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"FAIL {note}: unreadable ({exc})", file=sys.stderr)
+            any_fail = True
+            failed_notes += 1
+            continue
+        if not was:
+            continue
+        linted += 1
+        results.append([note, fails, flags, verify_val])
+
+    # FLAG e — batch-scoped duplicate 'Verify:' detection.
+    # A form gate cannot judge whether a recheck recipe is TRUE of its lesson (that
+    # is a Law, not a gap). But copy-paste is the MECHANISM that produces wrong ones,
+    # and equality across a batch is something a script can compute. Comparison is
+    # NORMALIZED (case-folded, whitespace-collapsed, trailing '.'/space stripped) —
+    # not byte-identical. Advisory only; the n/a exclusion keeps it from being noise.
+    groups: dict[str, list[int]] = {}
+    seen_paths: dict[str, set] = {}
+    for i, (note, _, _, verify_val) in enumerate(results):
+        key = normalize_verify(verify_val)
+        if key is None:
+            continue
+        # Overlapping argv (the same file twice, or a directory plus a file inside
+        # it) yields a note more than once; without this it would group with ITSELF
+        # and emit a false copy-paste flag. Scoped to the advisory pass only, so the
+        # counts line keeps its existing semantics.
+        resolved = str(note.resolve())
+        if resolved in seen_paths.setdefault(key, set()):
+            continue
+        seen_paths[key].add(resolved)
+        groups.setdefault(key, []).append(i)
+    for idxs in groups.values():
+        if len(idxs) < 2:
+            continue
+        for i in idxs:
+            others = sorted(str(results[j][0]) for j in idxs if j != i)
+            results[i][2].append(
+                f"'Verify:' line matches {len(others)} other note(s) in this batch "
+                f"after normalization, ignoring case and trailing punctuation "
+                f"({', '.join(others)}) — copy-paste is the usual cause; confirm the "
+                "recipe is true of THIS lesson"
+            )
+
+    for note, fails, flags, _ in results:
+        for f in fails:
+            print(f"FAIL {note}: {f}")
+            any_fail = True
+        if fails:
+            failed_notes += 1
+        for fl in flags:
+            print(f"FLAG {note}: {fl}")
+        if not fails:
+            print(f"ok   {note}" + (f"  ({len(flags)} flag(s))" if flags else ""))
+    # Always end with counts: a caller who captured N lessons can cross-check that
+    # N were actually linted — a vacuous run (gate not firing) must be visible,
+    # never indistinguishable from a healthy "nothing to do" (Phase-2 gauntlet).
+    print(
+        f"lesson-lint: {linted} lesson note(s) linted, {failed_notes} failed,"
+        f" {seen - linted} non-lesson file(s) skipped"
+    )
+    return 1 if any_fail else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

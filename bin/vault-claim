@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""vault-claim — atomic inbox claim-by-rename.
+
+Two sweep-mode /ingest sessions cannot both win the same inbox file:
+rename() is atomic on the same filesystem, so the loser fails loudly.
+
+Claim name: .claimed-<pid>-<original-name>
+A crashed Scribe leaves a .claimed-* behind; `sweep` restores any claim
+whose pid is dead AND whose mtime is older than --max-age-seconds.
+
+Stdlib-only. Never edits file contents.
+
+Usage:
+    vault-claim claim <file>
+    vault-claim release <file>
+    vault-claim sweep --inbox DIR [--max-age-seconds 3600]
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+PREFIX = ".claimed-"
+
+
+def fail(message: str) -> int:
+    print(f"vault-claim: error: {message}", file=sys.stderr)
+    return 1
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, just not ours
+    except OSError:
+        return True  # unknown → treat as alive; do not sweep
+    return True
+
+
+def exclusive_rename(src: Path, dest: Path) -> str | None:
+    """Hard-link dest then unlink src. Fails if dest exists (no POSIX overwrite)."""
+    try:
+        os.link(src, dest)
+    except FileExistsError:
+        return f"dest already exists: {dest.name}"
+    except OSError as exc:
+        return f"link failed: {exc}"
+    try:
+        os.unlink(src)
+    except OSError as exc:
+        return f"unlinked dest but source remains ({exc})"
+    return None
+
+
+def parse_claimed_name(name: str) -> tuple[int, str] | None:
+    if not name.startswith(PREFIX):
+        return None
+    rest = name[len(PREFIX) :]
+    dash = rest.find("-")
+    if dash < 1:
+        return None
+    pid_s, original = rest[:dash], rest[dash + 1 :]
+    if not pid_s.isdigit() or not original:
+        return None
+    return int(pid_s), original
+
+
+def claim_pid() -> int:
+    override = os.environ.get("VAULT_CLAIM_PID")
+    if override:
+        return int(override)
+    return os.getpid()
+
+
+def claim_path_for(src: Path) -> Path:
+    return src.with_name(f"{PREFIX}{claim_pid()}-{src.name}")
+
+
+def do_claim(path: Path) -> int:
+    if not path.is_file():
+        return fail(f"file not found: {path}")
+    if path.name.startswith(PREFIX):
+        return fail(f"already claimed: {path.name}")
+    dest = claim_path_for(path)
+    err = exclusive_rename(path, dest)
+    if err:
+        return fail(err)
+    print(dest)
+    return 0
+
+
+def do_release(path: Path) -> int:
+    if not path.is_file():
+        return fail(f"file not found: {path}")
+    parsed = parse_claimed_name(path.name)
+    if parsed is None:
+        return fail(f"not a claim file: {path.name}")
+    dest = path.with_name(parsed[1])
+    err = exclusive_rename(path, dest)
+    if err:
+        return fail(err)
+    print(dest)
+    return 0
+
+
+def do_sweep(inbox: Path, max_age: int) -> int:
+    if not inbox.is_dir():
+        return fail(f"inbox not found: {inbox}")
+    released = 0
+    import time
+
+    now = time.time()
+    for child in sorted(inbox.iterdir()):
+        if not child.is_file():
+            continue
+        parsed = parse_claimed_name(child.name)
+        if parsed is None:
+            continue
+        pid, original = parsed
+        age = now - child.stat().st_mtime
+        if age < max_age:
+            continue
+        if pid_alive(pid):
+            continue
+        dest = child.with_name(original)
+        err = exclusive_rename(child, dest)
+        if err:
+            print(f"skip: {child.name} ({err})", file=sys.stderr)
+            continue
+        released += 1
+        print(f"released {child.name} → {original}")
+    print(f"sweep: released {released}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="vault-claim")
+    sub = parser.add_subparsers(dest="cmd")
+
+    p_claim = sub.add_parser("claim")
+    p_claim.add_argument("file")
+
+    p_rel = sub.add_parser("release")
+    p_rel.add_argument("file")
+
+    p_sweep = sub.add_parser("sweep")
+    p_sweep.add_argument("--inbox", required=True)
+    p_sweep.add_argument("--max-age-seconds", type=int, default=3600)
+
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 2
+        return 2 if code else 0
+
+    if args.cmd == "claim":
+        return do_claim(Path(args.file).expanduser())
+    if args.cmd == "release":
+        return do_release(Path(args.file).expanduser())
+    if args.cmd == "sweep":
+        return do_sweep(Path(args.inbox).expanduser(), args.max_age_seconds)
+    parser.print_usage(sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
