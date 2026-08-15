@@ -23,7 +23,7 @@ Each step has a **Verify**. If the verify fails, stop. The next step will not fi
 | Python 3.12 | librarian runtime | `python3.12 --version` |
 | [uv](https://github.com/astral-sh/uv) | venv + install | `uv --version` |
 | git, gh optional | clone / later publish | — |
-| Claude Code **or** Grok Build | the ingest loop | without either: capture + CLI search only |
+| An agent host that can spawn subagents + MCP | the ingest loop (Scribe / Surgeon / Scout + librarian) | without that: capture + CLI search only. We ship wiring for Claude Code and Grok Build; they are not the only possible hosts. |
 | Network, once | first search downloads nomic-embed | ~a few hundred MB |
 
 macOS is the beaten path (`chflags`, TCC, iCloud landmines). Linux works if you skip the Mac-only lines. Windows is unproven.

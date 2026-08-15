@@ -38,7 +38,7 @@ The way is: **catalogue, then synthesize, then search.** Not dump-and-chat. Not 
 
 **Everybody with an agent harness can use it.** The loop is the product; the harness is the staff.
 
-**Do not use it** if you want a beautiful editor and a graph to get lost in — that is Obsidian, and it is better at that than this will ever be. Do not use it if you want "chat with my 400 PDFs" and no discipline — that is a RAG demo; it will feel faster until you need the same answer next month. Do not use it without Claude Code or Grok Build — you will get capture + a CLI, which is not the thing. Do not use it if you will write `sources/` by hand. Then this is a worse notes app.
+**Do not use it** if you want a beautiful editor and a graph to get lost in — that is Obsidian, and it is better at that than this will ever be. Do not use it if you want "chat with my 400 PDFs" and no discipline — that is a RAG demo; it will feel faster until you need the same answer next month. Do not use it if you have no agent that can spawn subagents and call MCP — you will get capture + a CLI, which is not the loop. Claude Code and Grok Build are the two we ship wiring for, not a closed list. Do not use it if you will write `sources/` by hand. Then this is a worse notes app.
 
 ## The physics
 
@@ -81,7 +81,7 @@ bin/vault-capture "the thing you would otherwise re-google" --tags idea
 
 [`/ingest`](slash-commands/personal/ingest.md) is Scribe. [`/synthesize`](slash-commands/personal/synthesize.md) is Surgeon. [`/audit`](slash-commands/personal/audit.md) is Scout. [`/recall`](slash-commands/personal/recall.md) is search over the index, not a vibe.
 
-Without a harness that can spawn subagents (Claude Code or Grok Build) you still have capture + a search CLI. You do not have the loop. Wire the staff: [INSTALL T-6](INSTALL.md#t-6). Flight test: [T-7](INSTALL.md#t-7).
+Without a harness that can spawn subagents and call MCP you still have capture + a search CLI. You do not have the loop. Claude Code and Grok Build are the beaten path ([INSTALL T-6](INSTALL.md#t-6)); any host that can run Scribe / Surgeon / Scout and register the librarian is enough. Flight test: [T-7](INSTALL.md#t-7).
 
 ## Flight rules
 
