@@ -10,6 +10,17 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${GROK_WORKSPACE_ROOT}/bin/vault-prompt-match\" --hook --root \"${GROK_WORKSPACE_ROOT}\"",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }
