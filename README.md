@@ -134,7 +134,7 @@ Company slash commands, scheduled Scout/Surgeon, and a store that is not sqlite-
 
 ## License
 
-No license file. Source-available. If you need terms, ask, or do not use it.
+[MIT](LICENSE). Use it. Keep the copyright notice. No warranty.
 
 ---
 
