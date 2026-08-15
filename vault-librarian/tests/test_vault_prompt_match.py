@@ -97,6 +97,8 @@ class TestPromptMatch:
         assert data["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
         assert "librarian import" in ctx
         assert "/recall" in ctx
+        assert "Vault title overlap" in ctx
+        assert "Do not re-derive" not in ctx
 
     def test_hook_mode_quiet_on_miss(self, tmp_path: Path) -> None:
         root = make_tree(tmp_path)

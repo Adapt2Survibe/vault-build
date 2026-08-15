@@ -122,9 +122,7 @@ def format_human(hits: list[tuple[int, str, str, str]]) -> str:
 def format_context(hits: list[tuple[int, str, str, str]]) -> str:
     body = format_human(hits)
     return (
-        "Vault may already have this. Do not re-derive until you /recall "
-        "or get_page the hits that actually match the user's task. "
-        "Ignore the rest.\n" + body
+        "Vault title overlap (not a retrieval; titles only):\n" + body
     )
 
 
