@@ -50,6 +50,3 @@ build/
 
 # Isolated git worktrees (never commit a checkout)
 .worktrees/
-
-# Regenerated at Grok SessionStart — titles only, not committed
-.grok/rules/vault-lesson-index.md
