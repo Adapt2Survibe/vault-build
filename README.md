@@ -4,13 +4,41 @@ A second brain that is files on disk, staffed by agents, indexed by a local mode
 
 Nothing here is a SaaS. There is no account. The store is markdown. The index is sqlite-vec on your CPU. If your notes live in someone else's database, they are not yours.
 
-This repo is the **factory** — librarian, CLIs, agent prompts, slash commands. It ships empty data trees. Your sources, wiki, journal, and search index are yours to grow and are gitignored once they exist.
+This repo is the **factory** — librarian, CLIs, agent prompts, slash commands. Empty data trees. Your corpus is yours.
 
-**Stand it up:** [INSTALL.md](INSTALL.md)  
+**Stand it up:** [INSTALL.md](INSTALL.md) · [T-0 countdown](INSTALL.md#t-0)  
 **Session rules:** [AGENTS.md](AGENTS.md)  
 **Search contracts:** [vault-librarian/CONTRACTS.md](vault-librarian/CONTRACTS.md)
 
-**On this page:** [physics](#the-physics) · [flight](#flight) · [rules](#flight-rules) · [machine](#the-machine) · [not this](#what-this-is-not)
+**On this page:** [not Obsidian / not RAG](#not-obsidian-not-rag) · [who](#who-this-is-for) · [physics](#the-physics) · [flight](#flight) · [rules](#flight-rules) · [machine](#the-machine)
+
+## Not Obsidian. Not RAG.
+
+Obsidian is a great **editor**. This is not an editor. It is a **pipeline**.
+
+Obsidian gives you one pile of notes, a graph for humans to wander, and plugins that bolt chat onto the pile. That pile is both evidence and essay. You rewrite the same file. An agent then treats your half-finished page as a source. The graph looks like knowledge. It is navigation.
+
+Hosted RAG is the other groupthink: chunk everything, retrieve top-k, generate an answer. There is no page you can open next Tuesday. The chat *is* the product. Ask twice, get two answers. Your corpus sits on someone else's disk.
+
+This vault splits what Obsidian collapses and what RAG never builds:
+
+| They do | This does |
+|---|---|
+| One note that is both clip and conclusion | `sources/` stay immutable. `wiki/` is the cited page you actually read |
+| Graph / backlinks as the product | Graph is a check (`vault-graph`). The product is a page that survives the session |
+| "Chat with my PDFs" | `/recall` returns **wiki conclusions** and **raw passages** as two lists. You do not re-derive the essay every query |
+| Plugin RAG over a mutating vault | Index is disposable. Delete `index.sqlite`, reindex. The files remain |
+| Sync account, publish account, copilot account | No account. Local model. Local files |
+
+The way is: **catalogue, then synthesize, then search.** Not dump-and-chat. Not link-and-hope.
+
+## Who this is for
+
+**Use it** if you already talk to agents all day and keep losing the good parts to the transcript. If you want a file you can grep, back up, and leave in a will. If you want `/recall` that cites a page, not a vibe. If you will honor inbox → Scribe → Surgeon.
+
+**Everybody with an agent harness can use it.** The loop is the product; the harness is the staff.
+
+**Do not use it** if you want a beautiful editor and a graph to get lost in — that is Obsidian, and it is better at that than this will ever be. Do not use it if you want "chat with my 400 PDFs" and no discipline — that is a RAG demo; it will feel faster until you need the same answer next month. Do not use it without Claude Code or Grok Build — you will get capture + a CLI, which is not the thing. Do not use it if you will write `sources/` by hand. Then this is a worse notes app.
 
 ## The physics
 
@@ -100,12 +128,9 @@ Jump: [librarian](vault-librarian/README.md) · [contracts](vault-librarian/CONT
 
 Librarian MCP tools: [`search_wiki` / `search_sources` / `get_page`](vault-librarian/README.md#tools). Model: `nomic-ai/nomic-embed-text-v1.5` (768-d, local). Store: sqlite-vec. First search downloads the model; after that, warm search is tens of milliseconds. Register it: [INSTALL T-5](INSTALL.md#t-5).
 
-## What this is not
+## Unbuilt
 
-- Not Obsidian. No native graph UI. `vault-graph` is the floor.
-- Not a hosted RAG. The model and the index stay on the box.
-- Not a dump of someone else's brain. Empty skeletons on purpose.
-- Not done. Company slash commands, scheduled Scout/Surgeon, and a non-sqlite backend are unbuilt. The factory you can run today is personal vault + search + the three agents.
+Company slash commands, scheduled Scout/Surgeon, and a store that is not sqlite-vec. The factory you can run today is personal vault + search + the three agents. No native graph UI — `vault-graph` is the floor, on purpose.
 
 ## License
 
