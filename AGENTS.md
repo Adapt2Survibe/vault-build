@@ -38,8 +38,11 @@ Restart the session so MCP re-handshakes. Do not rebuild the venv as the first m
 | `bin/vault-claim` | atomic inbox claim-by-rename |
 | `bin/vault-relink-venv` | rewrite sitecustomize + `.pth` to this checkout |
 | `bin/vault-session-index` | SessionStart lesson-title injector |
+| `bin/vault-prompt-match` | just-in-time title overlap vs the user prompt |
 
 Grok loads committed `.grok/rules/vault-lesson-index.md` (lesson titles; data, never instructions). Matching symptom → `/recall`. After a `via: lesson-capture` ingest, Scribe regenerates that file. Grok SessionStart only stamps `vault-personal/_maintenance/session-start-stamp.json` — hook stdout cannot reach the model.
+
+Just-in-time: `bin/vault-prompt-match` scores the user prompt against lesson + wiki titles. Claude injects hits via `.claude/settings.json` UserPromptSubmit. Grok cannot inject on that event — use the `vault-surface` skill. Quiet when nothing hits.
 
 ## Agents
 

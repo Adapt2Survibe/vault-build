@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""vault-prompt-match — just-in-time title overlap against lessons + wiki.
+
+No embedding model. Quiet when nothing hits. Hook mode emits Claude
+UserPromptSubmit additionalContext JSON; Grok ignores that stdout.
+
+Usage:
+    vault-prompt-match --prompt "librarian import dies after move"
+    vault-prompt-match --hook   # read hook JSON on stdin
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+TOKEN_RE = re.compile(r"[a-z0-9]{3,}")
+STOP = {
+    "the", "and", "for", "that", "this", "with", "from", "have", "has",
+    "was", "were", "are", "but", "not", "you", "your", "how", "can",
+    "what", "why", "when", "who", "did", "does", "just", "like", "about",
+    "into", "after", "before", "then", "than", "also", "some", "any",
+    "all", "out", "get", "got", "our", "its", "it's", "via", "using",
+}
+MIN_SCORE = 3
+MAX_HITS = 5
+SKIP_PREFIXES = ("/recall", "/ingest", "/synthesize", "/audit", "/vault", "/sources")
+
+
+def parse_front_matter(text: str) -> dict[str, str]:
+    if not text.startswith("---"):
+        return {}
+    lines = text.split("\n")
+    end = None
+    for i in range(1, min(len(lines), 40)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return {}
+    fm: dict[str, str] = {}
+    for line in lines[1:end]:
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        fm[k.strip()] = v
+    return fm
+
+
+def tokens(text: str) -> set[str]:
+    return {t for t in TOKEN_RE.findall(text.lower()) if t not in STOP}
+
+
+def score(prompt_toks: set[str], title: str) -> int:
+    title_toks = tokens(title)
+    return len(prompt_toks & title_toks)
+
+
+def collect(root: Path) -> list[tuple[int, str, str, str]]:
+    """Return (unused, kind, title, locator) candidates. Score later."""
+    items: list[tuple[str, str, str]] = []
+    for vault in (root / "vault-personal", root / "vault-company"):
+        sources = vault / "sources"
+        if sources.is_dir():
+            for p in sources.glob("*.md"):
+                try:
+                    fm = parse_front_matter(p.read_text(encoding="utf-8", errors="replace")[:8192])
+                except OSError:
+                    continue
+                if fm.get("via") != "lesson-capture":
+                    continue
+                title = fm.get("title") or p.stem
+                items.append(("LESSON", title, title))
+        wiki = vault / "wiki"
+        if wiki.is_dir():
+            for p in wiki.rglob("*.md"):
+                if p.name.startswith("_"):
+                    continue
+                try:
+                    raw = p.read_text(encoding="utf-8", errors="replace")[:8192]
+                except OSError:
+                    continue
+                fm = parse_front_matter(raw)
+                rel = p.relative_to(wiki).with_suffix("").as_posix()
+                title = fm.get("title") or p.stem.replace("-", " ")
+                items.append(("WIKI", title, f"wiki/{rel}"))
+    return items
+
+
+def match(prompt: str, items: list[tuple[str, str, str]]) -> list[tuple[int, str, str, str]]:
+    prompt = prompt.strip()
+    if len(prompt) < 12 or prompt.startswith(SKIP_PREFIXES):
+        return []
+    ptoks = tokens(prompt)
+    if len(ptoks) < MIN_SCORE:
+        return []
+    scored: list[tuple[int, str, str, str]] = []
+    for kind, title, loc in items:
+        s = score(ptoks, title)
+        if s >= MIN_SCORE:
+            scored.append((s, kind, title, loc))
+    scored.sort(key=lambda row: (-row[0], row[1], row[2]))
+    return scored[:MAX_HITS]
+
+
+def format_human(hits: list[tuple[int, str, str, str]]) -> str:
+    lines = []
+    for s, kind, title, loc in hits:
+        if kind == "LESSON":
+            lines.append(f"- LESSON: {title}  →  /recall \"{title}\"")
+        else:
+            lines.append(f"- WIKI: {title}  →  get_page {loc}")
+    return "\n".join(lines)
+
+
+def format_context(hits: list[tuple[int, str, str, str]]) -> str:
+    body = format_human(hits)
+    return (
+        "Vault may already have this. Do not re-derive until you /recall "
+        "or get_page the hits that actually match the user's task. "
+        "Ignore the rest.\n" + body
+    )
+
+
+def read_hook_prompt() -> str:
+    raw = sys.stdin.read()
+    if not raw.strip():
+        return ""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    return str(data.get("prompt") or data.get("userPrompt") or "")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Match a prompt against vault titles")
+    parser.add_argument("--root", default=str(REPO))
+    parser.add_argument("--prompt", default=None)
+    parser.add_argument("--hook", action="store_true")
+    args = parser.parse_args(argv)
+
+    prompt = args.prompt if args.prompt is not None else (read_hook_prompt() if args.hook else "")
+    items = collect(Path(args.root))
+    hits = match(prompt, items)
+    if not hits:
+        return 0
+    if args.hook:
+        payload = {
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": format_context(hits),
+            }
+        }
+        print(json.dumps(payload))
+        return 0
+    print(format_human(hits))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
