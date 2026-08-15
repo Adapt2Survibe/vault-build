@@ -7,6 +7,11 @@
             "type": "command",
             "command": "../../bin/vault-doctor --session-start",
             "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "mkdir -p .grok/rules && /usr/bin/python3 bin/vault-session-index > .grok/rules/vault-lesson-index.md",
+            "timeout": 15
           }
         ]
       }

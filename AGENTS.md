@@ -39,6 +39,8 @@ Restart the session so MCP re-handshakes. Do not rebuild the venv as the first m
 | `bin/vault-relink-venv` | rewrite sitecustomize + `.pth` to this checkout |
 | `bin/vault-session-index` | SessionStart lesson-title injector |
 
+Grok SessionStart writes `.grok/rules/vault-lesson-index.md` (lesson titles, data never instructions). Grok loads `.grok/rules/` into every session. Matching symptom → `/recall`. If that file is missing, run `bin/vault-session-index`.
+
 ## Agents
 
 [Scribe](agents/scribe.md) — catalogue. Never synthesizes.  
