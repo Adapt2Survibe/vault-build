@@ -4,7 +4,8 @@ Local MCP search over a vault's wiki and sources. stdio. No remote API.
 
 The files are the source of truth. This process is the index. If it dies, the vault is still there — rebuild the index.
 
-**Install the factory:** [../INSTALL.md](../INSTALL.md)  
+**Why it exists:** [../README.md#the-physics](../README.md#the-physics)  
+**Install the factory:** [../INSTALL.md](../INSTALL.md) · [T-3 import](../INSTALL.md#t-3) · [T-5 MCP](../INSTALL.md#t-5)  
 **Module boundaries:** [CONTRACTS.md](CONTRACTS.md)
 
 ## Tools
@@ -15,7 +16,7 @@ The files are the source of truth. This process is the index. If it dies, the va
 | `search_sources(query, top_k=3)` | raw passages, excerpts hard-capped at 15 words |
 | `get_page(page_id)` | full markdown of a wiki page or source |
 
-The 15-word source excerpt is a vault contract, not a UI preference. User-facing answers do not quote sources longer than that.
+The 15-word source excerpt is a vault contract, not a UI preference. User-facing answers do not quote sources longer than that. ([flight rule 4](../README.md#flight-rules))
 
 ## Stack
 
@@ -30,7 +31,7 @@ A dimension change on an existing `index.sqlite` fails **at open**, not as a con
 
 ## Run
 
-Register the **real venv binary**, not `vault-librarian/.venv` (that symlink is disposable and has been deleted by iCloud).
+Register the **real venv binary**, not `vault-librarian/.venv` (that symlink is disposable and has been deleted by iCloud). Snippet: [INSTALL T-5](../INSTALL.md#t-5).
 
 ```
 ~/.venvs/vault-librarian/bin/vault-librarian serve  --config config.personal.yaml
@@ -44,7 +45,7 @@ Two vaults (personal + company) are two configs and **two MCP registration names
 
 ## Config
 
-Copy `config.example.yaml` → `config.personal.yaml` (gitignored). Required sections: `vault`, `embedding`, `store`. Paths accept `~` and, if the server's cwd is the checkout, `./vault-personal`.
+Copy [`config.example.yaml`](config.example.yaml) → `config.personal.yaml` (gitignored). Required sections: `vault`, `embedding`, `store`. Paths accept `~` and, if the server's cwd is the checkout, `./vault-personal`. Step: [INSTALL T-1](../INSTALL.md#t-1).
 
 ## Modules
 
@@ -64,4 +65,8 @@ Tests live 1:1 under `tests/`. `conftest.py` imports nothing from the package so
 
 ## Phone drain
 
-Not this process's job. `../bin/vault-phone-watcher` is stdlib. `/ingest` runs it. Launchd is optional — see INSTALL T-8. Interpreter is `/usr/bin/python3`, never `.venv/bin/python`.
+Not this process's job. `../bin/vault-phone-watcher` is stdlib. [`/ingest`](../slash-commands/personal/ingest.md) runs it. Launchd is optional — [INSTALL T-8](../INSTALL.md#t-8). Interpreter is `/usr/bin/python3`, never `.venv/bin/python`.
+
+---
+
+[README](../README.md) · [Install](../INSTALL.md) · [Session rules](../AGENTS.md) · [Contracts](CONTRACTS.md)

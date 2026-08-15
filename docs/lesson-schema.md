@@ -1,5 +1,7 @@
 # Vault Lesson Schema
 
+[README](../README.md) · [Install](../INSTALL.md) · [Session rules](../AGENTS.md) · [lint via `bin/lesson-lint`](../AGENTS.md#tools-stdlib-no-venv)
+
 **The single source of truth for how a cross-project engineering lesson is captured.** Every capture path — a lesson-capture rule in the operator's agent instructions, a session closeout sweep, and a hand-run `vault-capture` — MUST produce lessons in this shape and reference THIS file rather than re-describing the format (re-descriptions drift). The machine-checkable half of this schema is enforced deterministically by `bin/lesson-lint` (§ Enforcement); the judgment half is the AI's.
 
 ## When something is a lesson (the filter — all three must hold) — JUDGMENT, not linted

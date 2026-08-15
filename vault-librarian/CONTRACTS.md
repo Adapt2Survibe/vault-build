@@ -1,5 +1,7 @@
 # vault-librarian — Interface Contracts (Phase 1)
 
+[Librarian README](README.md) · [Install](../INSTALL.md) · [Factory README](../README.md)
+
 **Status:** LOCKED for the 2026-06-12 autonomous build. Builders implement against this spec exactly. Deviations require a written note in the builder's return payload.
 **Amended 2026-06-12 (post-review-wall):** see the "Review-wall amendments" section at the bottom — those clauses supersede conflicting text above them.
 **Scope:** Phase 1, Mac-local, personal vault. stdio MCP transport. sqlite-vec backend.
